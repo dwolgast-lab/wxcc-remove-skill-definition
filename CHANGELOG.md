@@ -10,6 +10,31 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.2.0] — 2026-05-15
+
+### Added
+- CSV report output — every run writes a timestamped `wxcc_report_*.csv` with per-skill
+  status, counts of objects updated, and notes (use `--report FILE` to name it explicitly)
+- `--report FILE` CLI option to specify a custom report path
+
+### Changed
+- Reference discovery now uses the dedicated `/skill/{id}/incoming-references` API instead
+  of scanning all skill profiles, queues, and flows — faster and more accurate
+- Flow references **block deletion** immediately with a clear message listing which flows
+  must be updated in Flow Designer before retrying; no confirmation prompt is shown
+- Confirmation prompt now only appears when queue references require modification;
+  profile-only and no-reference deletions proceed automatically
+- Corrected all WxCC REST API endpoint paths based on live testing:
+  - Skills: `/organization/{orgId}/skill`
+  - Skill profiles: `/organization/{orgId}/skill-profile` (GET: `?includeSkillDetails=`, PUT: `?skillProfileDTO=`)
+  - Queues: `/organization/{orgId}/v2/contact-service-queue`
+- Skill profile skill entries now correctly identified under `activeSkills` key
+- Queue skill entries now correctly identified under `queueSkillRequirements` key
+- Fixed OAuth2 scope names in docs: `cjp:config_read` / `cjp:config_write` (underscores)
+- Report CSVs and input CSV files excluded from version control via `.gitignore`
+
+---
+
 ## [0.1.0] — 2026-05-15
 
 ### Added
@@ -29,5 +54,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Rich terminal output: colour-coded tables, progress status, confirmation prompts
 - `docs/USER_GUIDE.md` covering full provisioning and usage
 
-[Unreleased]: https://github.com/dwolgast-lab/wxcc-remove-skill-definition/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/dwolgast-lab/wxcc-remove-skill-definition/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/dwolgast-lab/wxcc-remove-skill-definition/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dwolgast-lab/wxcc-remove-skill-definition/releases/tag/v0.1.0

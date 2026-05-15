@@ -25,7 +25,7 @@ from auth import build_auth
 from client import WxCCClient, VALID_REGIONS
 from processor import SkillDeletionProcessor
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 console = Console()
 
