@@ -39,3 +39,8 @@ htmlcov/
 # Generated output
 wxcc_report_*.csv
 *.csv
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
