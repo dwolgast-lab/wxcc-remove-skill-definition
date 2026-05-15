@@ -1,6 +1,6 @@
 # wxcc-remove-skill-definition — User Guide
 
-**Version:** 0.1.0  
+**Version:** 0.2.0  
 **Last updated:** 2026-05-15
 
 ---
@@ -19,6 +19,7 @@
    - 6B. [Bulk delete from CSV](#6b-bulk-delete-from-csv)
    - 6C. [Interactive mode](#6c-interactive-mode)
    - 6D. [Dry-run (preview only)](#6d-dry-run-preview-only)
+   - 6E. [Report output](#6e-report-output)
 7. [What the tool does — step by step](#7-what-the-tool-does--step-by-step)
 8. [Reference cascade and confirmation rules](#8-reference-cascade-and-confirmation-rules)
 9. [CSV file format](#9-csv-file-format)
@@ -36,8 +37,10 @@ Skill definitions cannot be deleted in the WxCC UI while they are still referenc
 
 **Key behaviour:**
 - Skill Profiles that reference the skill are updated automatically (no confirmation required)
-- Queues and Flows that reference the skill require your confirmation before any changes are made
+- Queues that reference the skill require your confirmation before any changes are made
+- Flows that reference the skill **block deletion** — the tool tells you which flows to update in Flow Designer, then you re-run
 - `--dry-run` mode lets you see exactly what *would* happen without touching anything
+- A CSV report is written after every run
 
 ---
 
@@ -159,7 +162,7 @@ Open `.env` in a text editor. It should look like this:
 
 ```dotenv
 # WxCC tenant settings
-WXCC_ORG_ID=174bc2cb-6f00-48c5-b5ce-f4a93ffec5df
+WXCC_ORG_ID=your-org-id-here
 WXCC_REGION=us1
 
 # --- Choose ONE authentication option ---
@@ -237,6 +240,28 @@ python main.py --csv skills_to_delete.csv --dry-run
 
 A dry-run is strongly recommended the first time you use the tool in a new tenant.
 
+### 6E. Report output
+
+After every run the tool writes a CSV report summarising what happened. By default it is saved in the current directory as `wxcc_report_YYYYMMDD_HHMMSS.csv`. Use `--report` to choose a specific path:
+
+```bash
+python main.py --csv skills_to_delete.csv --report results.csv
+```
+
+The report contains one row per skill with the following columns:
+
+| Column | Description |
+|--------|-------------|
+| `timestamp` | When this skill was processed |
+| `input` | Name or ID as entered |
+| `skill_name` | Resolved display name |
+| `skill_id` | Resolved UUID |
+| `status` | `SUCCESS`, `NOT_FOUND`, `ABORTED`, `BLOCKED_BY_FLOW`, `DRY_RUN`, or `ERROR` |
+| `profiles_updated` | Number of skill profiles modified |
+| `queues_updated` | Number of queues modified |
+| `flows_flagged` | Number of flows that blocked deletion |
+| `notes` | Flow names requiring manual review, or error details |
+
 ---
 
 ## 7. What the tool does — step by step
@@ -245,22 +270,21 @@ For each skill, the tool follows this sequence:
 
 1. **Resolve the skill** — looks up the skill definition by name or ID using the WxCC API. If not found, the tool reports an error and moves on.
 
-2. **Scan for references** — queries three resource types:
-   - Skill Profiles (`/skill-profile`)
-   - Queues (`/queue`)
-   - Flows (`/flow`)
+2. **Scan for references** — calls the WxCC `incoming-references` API to find all objects that reference this skill in a single query.
 
 3. **Display a summary** — shows a colour-coded table of everything that references the skill, categorised by how it will be handled.
 
-4. **Request confirmation** — if Queues or Flows are affected, you are shown a warning and must type `y` to proceed. If only Skill Profiles are affected, a simpler confirmation is shown. You can always answer `n` to abort without any changes.
+4. **Check for flow references** — if any flows reference the skill, the tool **stops immediately** and lists the flows. The WxCC API will not allow deletion while a flow references the skill. Remove the skill from those flows in WxCC Flow Designer, then re-run the tool. The result is recorded as `BLOCKED_BY_FLOW` in the report.
 
-5. **Remove from Skill Profiles** — the tool fetches each affected Skill Profile, removes the skill entry, and PUTs the updated profile back. This happens automatically without per-profile confirmation.
+5. **Remove from Skill Profiles** — the tool fetches each affected Skill Profile, removes the skill entry, and updates the profile automatically. No confirmation is required.
 
-6. **Remove from Queues** — only queues with a *direct* skill reference are modified (the skill entry is removed from the queue object). Queues that are affected *indirectly* because they use an affected Skill Profile are shown for awareness but do not require a queue-level change.
+6. **Request confirmation for Queues** — if any queues reference the skill directly, you are shown a warning and must confirm before proceeding. Answer `n` to abort without any changes.
 
-7. **Flag Flows for manual review** — programmatic modification of WxCC Flow definitions is not supported. If flows are found that reference the skill ID, the tool lists them and asks you to review them manually in WxCC Flow Builder.
+7. **Remove from Queues** — the skill entry is removed from each confirmed queue.
 
 8. **Delete the skill definition** — once all references are cleared, the skill definition is deleted.
+
+9. **Write report** — results are appended to the run's CSV report.
 
 ---
 
@@ -269,9 +293,10 @@ For each skill, the tool follows this sequence:
 | Object type | How handled |
 |-------------|------------|
 | **Skill Profiles** | Automatically updated — skill entry removed, no confirmation needed |
-| **Queues (direct ref)** | Requires confirmation — queue object updated to remove skill |
-| **Queues (via Skill Profile)** | Shown for awareness only — no queue update needed (profile update covers it) |
-| **Flows** | Requires confirmation to proceed with deletion — flows listed for manual review in Flow Builder |
+| **Queues** | Requires confirmation — queue object updated to remove skill |
+| **Flows** | **Block deletion** — tool stops and lists flows for manual review in Flow Designer |
+
+> **Why flows block deletion:** The WxCC API rejects skill deletion with HTTP 412 if any flow still references the skill. Unlike skill profiles and queues, flow definitions cannot be modified via the Configuration API. You must open each listed flow in WxCC Flow Designer, remove the skill reference, publish the flow, and then re-run this tool.
 
 ---
 
@@ -304,7 +329,7 @@ abc-123-0000-0000-skill
 def-456-0000-0000-skill
 ```
 
-**Example — mixed names and IDs, no header:**
+**Example — plain list, no header:**
 
 ```csv
 Spanish Language
@@ -320,7 +345,7 @@ Lines where the skill column is empty are skipped. The file should be UTF-8 enco
 
 ```
 usage: wxcc_remove_skill [-h] [--version] [--org-id ORG_ID] [--region REGION]
-                          [--dry-run] [--env FILE]
+                          [--dry-run] [--env FILE] [--report FILE]
                           [--skill NAME_OR_ID | --csv FILE | --interactive]
 
 options:
@@ -331,6 +356,8 @@ options:
                         Choices: us1 us2 eu1 eu2 anz1 jp1 ca1 in1
   --dry-run             Preview actions without making any API changes
   --env FILE            Path to .env file (default: .env in current directory)
+  --report FILE         Path for the CSV results report
+                        (default: wxcc_report_YYYYMMDD_HHMMSS.csv)
 
 modes (mutually exclusive):
   --skill NAME_OR_ID    Delete a single skill by exact name or ID
@@ -360,17 +387,15 @@ Your account or service app does not have the required WxCC scopes (`cjp:config_
 
 ### "Skill not found: [name]"
 
-The skill name does not match exactly (matching is case-insensitive but otherwise exact). Try using the skill's UUID instead. You can retrieve all skill definitions by running:
+The skill name does not match exactly (matching is case-insensitive but otherwise exact). Try using the skill's UUID instead. You can find skill UUIDs in the WxCC Provisioning UI under **Skills**, or by running the tool in `--interactive` mode and entering any name — the API response will include available skills.
 
-```bash
-python main.py --interactive
-```
+### Status is BLOCKED_BY_FLOW in the report
 
-and entering an invalid name — the tool will list what it found (or check the WxCC Provisioning UI under **Skills**).
+One or more flows reference the skill. Open each flow listed in the tool output in **WxCC Flow Designer**, remove the skill reference (typically in a Queue Contact activity), publish the flow, and re-run the tool.
 
-### "HTTP 409: Conflict" when deleting
+### "HTTP 412: Entity is referred in other entities"
 
-Another reference still exists that the tool did not find. This can happen if the WxCC API's `/flow` endpoint was unavailable and a flow still references the skill. Review flows manually in WxCC Flow Builder, remove the skill reference, and re-run the tool.
+A reference still exists that was not cleared. This should not normally occur after a successful run. Check whether a flow was modified between scans, or whether a new reference was created concurrently. Re-run the tool to re-scan.
 
 ### Tool hangs or times out
 
