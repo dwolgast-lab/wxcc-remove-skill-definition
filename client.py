@@ -30,8 +30,11 @@ class WxCCClient:
     # Low-level helpers
     # ------------------------------------------------------------------
 
-    def _url(self, resource: str) -> str:
-        return f"{self._base}/organization/{self.org_id}/{resource.lstrip('/')}"
+    def _url(self, path: str) -> str:
+        return f"{self._base}/{path.lstrip('/')}"
+
+    def _org(self, path: str) -> str:
+        return f"organization/{self.org_id}/{path.lstrip('/')}"
 
     def _headers(self) -> dict:
         return {
@@ -40,8 +43,8 @@ class WxCCClient:
             "Accept": "application/json",
         }
 
-    def _request(self, method: str, resource: str, **kwargs) -> Any:
-        url = self._url(resource)
+    def _request(self, method: str, path: str, **kwargs) -> Any:
+        url = self._url(path)
         for attempt in range(self.MAX_RETRIES):
             resp = self._session.request(method, url, headers=self._headers(), timeout=30, **kwargs)
 
@@ -68,19 +71,19 @@ class WxCCClient:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            for key in ("data", "dataList", "items", "records", "results", "content"):
+            for key in ("data", "dataList", "items", "records", "results", "content", "value"):
                 if key in data and isinstance(data[key], list):
                     return data[key]
         return []
 
-    def _get_all(self, resource: str, extra_params: dict | None = None) -> list:
+    def _get_all(self, path: str, extra_params: dict | None = None) -> list:
         """Fetch every page and return a flat list."""
         results: list = []
         page = 0
         while True:
             params = dict(extra_params or {})
             params.update({"page": page, "pageSize": self.PAGE_SIZE})
-            data = self._request("GET", resource, params=params)
+            data = self._request("GET", path, params=params)
             batch = self._items(data)
             results.extend(batch)
             if len(batch) < self.PAGE_SIZE:
@@ -89,17 +92,14 @@ class WxCCClient:
         return results
 
     # ------------------------------------------------------------------
-    # Skill Definitions
+    # Skill Definitions  —  /organization/{orgId}/skill
     # ------------------------------------------------------------------
 
     def get_skill_definitions(self) -> list[dict]:
-        return self._get_all("skill-definition")
-
-    def get_skill_definition(self, skill_id: str) -> dict:
-        return self._request("GET", f"skill-definition/{skill_id}")
+        return self._get_all(self._org("skill"))
 
     def delete_skill_definition(self, skill_id: str) -> None:
-        self._request("DELETE", f"skill-definition/{skill_id}")
+        self._request("DELETE", self._org(f"skill/{skill_id}"))
 
     def find_skill(self, name_or_id: str) -> dict | None:
         """Resolve a skill by exact ID or case-insensitive name."""
@@ -110,42 +110,93 @@ class WxCCClient:
                 return skill
         return None
 
-    # ------------------------------------------------------------------
-    # Skill Profiles
-    # ------------------------------------------------------------------
+    def get_skill_references(self, skill_id: str) -> list[dict]:
+        """Return all objects that reference this skill, each tagged with '_entity_type'.
 
-    def get_skill_profiles(self) -> list[dict]:
-        return self._get_all("skill-profile")
+        The incoming-references API returns refs grouped by entity type, with the
+        type stored in meta.currentEntity rather than on individual items.  Multiple
+        entity types may require separate paginated calls.
+        """
+        base = self._org(f"skill/{skill_id}/incoming-references")
+        all_refs: list[dict] = []
+        seen: set[str] = set()
 
-    def get_skill_profile(self, profile_id: str) -> dict:
-        return self._request("GET", f"skill-profile/{profile_id}")
+        def _collect(entity_type: str | None, page: int) -> dict | None:
+            params: dict = {"page": page, "pageSize": self.PAGE_SIZE}
+            if entity_type:
+                params["currentEntity"] = entity_type
+            try:
+                return self._request("GET", base, params=params)
+            except WxCCAPIError:
+                return None
 
-    def update_skill_profile(self, profile_id: str, data: dict) -> dict:
-        return self._request("PUT", f"skill-profile/{profile_id}", json=data)
+        def _process_response(resp: dict) -> tuple[str, int]:
+            """Tag items with their entity type; return (entity_type, total_pages)."""
+            meta = resp.get("meta", {})
+            etype = meta.get("currentEntity", "unknown")
+            total = meta.get("totalPages", 1)
+            for ref in resp.get("data", []):
+                ref["_entity_type"] = etype
+                all_refs.append(ref)
+            return etype, total
 
-    # ------------------------------------------------------------------
-    # Queues
-    # ------------------------------------------------------------------
-
-    def get_queues(self) -> list[dict]:
-        return self._get_all("queue")
-
-    def get_queue(self, queue_id: str) -> dict:
-        return self._request("GET", f"queue/{queue_id}")
-
-    def update_queue(self, queue_id: str, data: dict) -> dict:
-        return self._request("PUT", f"queue/{queue_id}", json=data)
-
-    # ------------------------------------------------------------------
-    # Flows
-    # ------------------------------------------------------------------
-
-    def get_flows(self) -> list[dict]:
-        try:
-            return self._get_all("flow")
-        except WxCCAPIError:
-            # Flow API may require elevated scopes or be unavailable in some tenants
+        # First call — reveals which entity types have references
+        resp = _collect(None, 0)
+        if not resp:
             return []
 
-    def get_flow(self, flow_id: str) -> dict:
-        return self._request("GET", f"flow/{flow_id}")
+        meta = resp.get("meta", {})
+        referenced_entities: list[str] = meta.get("referencedEntities", [])
+        etype, total_pages = _process_response(resp)
+        seen.add(etype)
+
+        for page in range(1, total_pages):
+            r = _collect(etype, page)
+            if r:
+                _process_response(r)
+
+        # Collect any remaining entity types
+        for et in referenced_entities:
+            if et in seen:
+                continue
+            page = 0
+            while True:
+                r = _collect(et, page)
+                if not r:
+                    break
+                _, tp = _process_response(r)
+                seen.add(et)
+                page += 1
+                if page >= tp:
+                    break
+
+        return all_refs
+
+    # ------------------------------------------------------------------
+    # Skill Profiles  —  /organization/{orgId}/v2/skill-profile
+    # ------------------------------------------------------------------
+
+    def get_skill_profile(self, profile_id: str) -> dict:
+        return self._request(
+            "GET",
+            self._org(f"skill-profile/{profile_id}"),
+            params={"includeSkillDetails": ""},
+        )
+
+    def update_skill_profile(self, profile_id: str, data: dict) -> dict:
+        return self._request(
+            "PUT",
+            self._org(f"skill-profile/{profile_id}"),
+            params={"skillProfileDTO": ""},
+            json=data,
+        )
+
+    # ------------------------------------------------------------------
+    # Queues  —  /organization/{orgId}/v2/contact-service-queue
+    # ------------------------------------------------------------------
+
+    def get_queue(self, queue_id: str) -> dict:
+        return self._request("GET", self._org(f"v2/contact-service-queue/{queue_id}"))
+
+    def update_queue(self, queue_id: str, data: dict) -> dict:
+        return self._request("PUT", self._org(f"v2/contact-service-queue/{queue_id}"), json=data)

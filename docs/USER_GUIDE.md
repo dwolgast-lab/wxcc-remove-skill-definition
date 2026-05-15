@@ -119,7 +119,8 @@ A Webex Service App uses the OAuth 2.0 client-credentials grant. Tokens auto-ref
    - **Description:** Optional, but helpful for auditing
    - **Icon:** Optional
 6. Under **Scopes**, select **at minimum**:
-   - `cjp:config` — read WxCC configuration
+   - `cjp:config` — general WxCC configuration access
+   - `cjp:config_read` — read WxCC configuration
    - `cjp:config_write` — modify WxCC configuration
 7. Click **Add Service App**.
 8. On the confirmation page, copy and save:
@@ -136,7 +137,7 @@ The Service App will not work until a **Full Administrator** of the target WxCC 
 3. Click **Authorize Service App**.
 4. In the search box, enter the **Client ID** of the app created in Step 1.
 5. Select the app from the results.
-6. Review the requested scopes (`cjp:config`, `cjp:config_write`) and click **Authorize**.
+6. Review the requested scopes (`cjp:config`, `cjp:config_read`, `cjp:config_write`) and click **Authorize**.
 
 > **Note for self-service clients:** If you are setting this up for your own tenant, you can perform both steps above yourself as long as you have both developer.webex.com access and Full Administrator rights in Control Hub.
 
@@ -355,7 +356,7 @@ For personal token: the token has expired. Return to [developer.webex.com](https
 
 ### "HTTP 403: Forbidden"
 
-Your account or service app does not have the required WxCC scopes (`cjp:config_write`). Check the app's scopes in [developer.webex.com/my-apps](https://developer.webex.com/my-apps) and re-authorize in Control Hub.
+Your account or service app does not have the required WxCC scopes (`cjp:config_read`, `cjp:config_write`). Check the app's scopes in [developer.webex.com/my-apps](https://developer.webex.com/my-apps) and re-authorize in Control Hub.
 
 ### "Skill not found: [name]"
 

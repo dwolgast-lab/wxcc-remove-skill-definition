@@ -35,3 +35,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Generated output
+wxcc_report_*.csv
+*.csv

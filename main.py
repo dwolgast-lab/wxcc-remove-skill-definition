@@ -14,6 +14,7 @@ import argparse
 import csv
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -71,6 +72,11 @@ Examples:
         default=".env",
         metavar="FILE",
         help="Path to .env file (default: .env in current directory)",
+    )
+    parser.add_argument(
+        "--report",
+        metavar="FILE",
+        help="Path for the CSV results report (default: wxcc_report_YYYYMMDD_HHMMSS.csv)",
     )
 
     mode = parser.add_mutually_exclusive_group()
@@ -204,6 +210,13 @@ def interactive_mode(processor: SkillDeletionProcessor) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _report_path(args: argparse.Namespace) -> str:
+    if args.report:
+        return args.report
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"wxcc_report_{ts}.csv"
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -224,11 +237,14 @@ def main() -> None:
 
     if args.skill:
         ok = processor.process(args.skill)
+        processor.write_report(_report_path(args))
         sys.exit(0 if ok else 1)
     elif args.csv:
         process_csv_file(processor, args.csv)
+        processor.write_report(_report_path(args))
     else:
         interactive_mode(processor)
+        processor.write_report(_report_path(args))
 
 
 if __name__ == "__main__":

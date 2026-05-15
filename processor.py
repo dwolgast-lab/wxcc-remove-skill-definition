@@ -1,6 +1,8 @@
 """Core skill-deletion logic: find references, confirm, clean up, delete."""
 
+import csv
 import json
+from datetime import datetime
 
 from rich.console import Console
 from rich.prompt import Confirm
@@ -27,10 +29,22 @@ def _skill_id_from_detail(detail: dict) -> str:
 
 def _skills_key(obj: dict) -> str:
     """Return whichever key this object uses to store skill entries."""
-    for k in ("skillsDetails", "skills", "skillRequirements"):
+    for k in ("activeSkills", "queueSkillRequirements", "skillsDetails", "skills", "skillRequirements"):
         if k in obj:
             return k
-    return "skillsDetails"
+    return "activeSkills"
+
+
+def _ref_type(ref: dict) -> str:
+    """Extract a normalised type string from an incoming-reference entry."""
+    raw = (
+        ref.get("_entity_type")
+        or ref.get("type")
+        or ref.get("entityType")
+        or ref.get("refType")
+        or ""
+    )
+    return raw.upper().replace("-", "_").replace(" ", "_")
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +55,7 @@ class SkillDeletionProcessor:
     def __init__(self, client: WxCCClient, dry_run: bool = False):
         self.client = client
         self.dry_run = dry_run
+        self.results: list[dict] = []
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -51,6 +66,18 @@ class SkillDeletionProcessor:
 
         Returns True on success (or successful dry-run), False on abort/not-found.
         """
+        result: dict = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "input": skill_identifier,
+            "skill_name": "",
+            "skill_id": "",
+            "status": "",
+            "profiles_updated": 0,
+            "queues_updated": 0,
+            "flows_flagged": 0,
+            "notes": "",
+        }
+
         console.rule(f"[bold]{skill_identifier}")
 
         with console.status("Resolving skill definition..."):
@@ -58,112 +85,102 @@ class SkillDeletionProcessor:
 
         if not skill:
             console.print(f"[red]Not found:[/red] {skill_identifier!r}")
+            result["status"] = "NOT_FOUND"
+            self.results.append(result)
             return False
 
         skill_id: str = skill["id"]
         skill_name: str = skill.get("name", skill_id)
+        result["skill_name"] = skill_name
+        result["skill_id"] = skill_id
         console.print(
             f"[green]Found:[/green] {skill_name}  "
             f"[dim]ID={skill_id}  type={skill.get('type', '?')}[/dim]"
         )
 
-        # Discover all references
-        with console.status("Scanning for references (skill profiles, queues, flows)..."):
-            profiles = self._find_profile_refs(skill_id)
-            queues = self._find_queue_refs(skill_id, profiles)
-            flows = self._find_flow_refs(skill_id)
+        # Discover all references via the incoming-references endpoint
+        with console.status("Scanning for references..."):
+            profiles, queues, flows = self._find_all_refs(skill_id)
 
+        result["flows_flagged"] = len(flows)
         self._print_summary(profiles, queues, flows)
 
-        # Decide confirmation strategy
-        if not self._get_approval(skill_name, profiles, queues, flows):
-            console.print("[yellow]Aborted.[/yellow]")
+        # Flows block deletion — the WxCC API will reject the delete while a flow
+        # still references the skill. Tell the user to fix them first and stop.
+        if flows:
+            flow_names = [f.get("name", f.get("id", "?")) for f in flows]
+            console.print(
+                "\n[bold red]Cannot delete[/bold red] — this skill is referenced by "
+                f"{len(flows)} flow(s). Remove the skill from the following flow(s) in "
+                "WxCC Flow Designer, then run this tool again:\n"
+                + "".join(f"  • {n}\n" for n in flow_names)
+            )
+            result["status"] = "BLOCKED_BY_FLOW"
+            result["notes"] = "Remove skill from flows first: " + ", ".join(flow_names)
+            self.results.append(result)
             return False
 
         if self.dry_run:
             console.print("[dim]DRY RUN — no changes made.[/dim]")
+            result["status"] = "DRY_RUN"
+            parts = []
+            if profiles:
+                parts.append(f"{len(profiles)} profile(s) would be updated")
+            if queues:
+                parts.append(f"{len(queues)} queue(s) affected")
+            result["notes"] = "; ".join(parts) if parts else "No references found"
+            self.results.append(result)
             return True
+
+        # Decide confirmation strategy (no flows at this point)
+        if not self._get_approval(skill_name, profiles, queues):
+            console.print("[yellow]Aborted.[/yellow]")
+            result["status"] = "ABORTED"
+            self.results.append(result)
+            return False
 
         # 1. Auto-remove from skill profiles
         for profile in profiles:
-            self._remove_from_profile(profile, skill_id)
+            if self._remove_from_profile(profile, skill_id):
+                result["profiles_updated"] += 1
 
-        # 2. Remove direct skill references from queues (indirect queue impacts
-        #    are handled by the profile update above)
-        for entry in queues:
-            if entry["reason"] == "direct":
-                self._remove_from_queue(entry["queue"], skill_id)
-
-        # 3. Flows: programmatic modification is out of scope; advise manual review
-        if flows:
-            console.print(
-                "\n[yellow]NOTE:[/yellow] The following flows reference this skill ID. "
-                "Please review them manually in WxCC Flow Builder:"
-            )
-            for flow in flows:
-                console.print(f"  • {flow.get('name', flow.get('id', '?'))}")
+        # 2. Remove direct skill references from queues
+        for queue in queues:
+            if self._remove_from_queue(queue, skill_id):
+                result["queues_updated"] += 1
 
         # 4. Delete the skill definition itself
-        with console.status(f"Deleting skill definition '{skill_name}'..."):
-            self.client.delete_skill_definition(skill_id)
+        try:
+            with console.status(f"Deleting skill definition '{skill_name}'..."):
+                self.client.delete_skill_definition(skill_id)
+        except WxCCAPIError as exc:
+            console.print(f"[red]✗[/red] Delete failed: {exc}")
+            result["status"] = "ERROR"
+            result["notes"] = (result["notes"] + "; " if result["notes"] else "") + str(exc)
+            self.results.append(result)
+            return False
 
         console.print(f"\n[bold green]✓[/bold green] Deleted skill: [bold]{skill_name}[/bold]")
+        result["status"] = "SUCCESS"
+        self.results.append(result)
         return True
 
     # ------------------------------------------------------------------
     # Reference discovery
     # ------------------------------------------------------------------
 
-    def _find_profile_refs(self, skill_id: str) -> list[dict]:
-        """Return all skill profiles whose skillsDetails contain skill_id."""
-        result = []
-        for profile in self.client.get_skill_profiles():
-            key = _skills_key(profile)
-            for detail in profile.get(key, []):
-                if _skill_id_from_detail(detail) == skill_id:
-                    result.append(profile)
-                    break
-        return result
-
-    def _find_queue_refs(self, skill_id: str, affected_profiles: list[dict]) -> list[dict]:
-        """Return queues with a direct skill reference OR that use an affected skill profile.
-
-        Each entry is {"queue": <dict>, "reason": "direct" | "via_profile"}.
-        The "via_profile" entries are informational — they don't require a queue
-        update, but the user should know their routing behaviour will change.
-        """
-        profile_ids = {p["id"] for p in affected_profiles}
-        seen_ids: set[str] = set()
-        result = []
-
-        for queue in self.client.get_queues():
-            qid = queue.get("id", "")
-            if qid in seen_ids:
-                continue
-
-            # Direct skill reference on the queue object
-            key = _skills_key(queue)
-            for detail in queue.get(key, []):
-                if _skill_id_from_detail(detail) == skill_id:
-                    result.append({"queue": queue, "reason": "direct"})
-                    seen_ids.add(qid)
-                    break
-            else:
-                # Indirect: queue's skill profile contains the skill
-                q_profile = queue.get("skillProfileId", "")
-                if q_profile and q_profile in profile_ids:
-                    result.append({"queue": queue, "reason": "via_profile"})
-                    seen_ids.add(qid)
-
-        return result
-
-    def _find_flow_refs(self, skill_id: str) -> list[dict]:
-        """Search flow definitions (JSON dump) for the skill ID string."""
-        result = []
-        for flow in self.client.get_flows():
-            if skill_id in json.dumps(flow):
-                result.append(flow)
-        return result
+    def _find_all_refs(self, skill_id: str) -> tuple[list[dict], list[dict], list[dict]]:
+        """Call incoming-references and split into profiles / queues / flows."""
+        profiles, queues, flows = [], [], []
+        for ref in self.client.get_skill_references(skill_id):
+            t = _ref_type(ref)
+            if "PROFILE" in t:
+                profiles.append(ref)
+            elif "QUEUE" in t or "CONTACT_SERVICE" in t:
+                queues.append(ref)
+            elif "FLOW" in t:
+                flows.append(ref)
+        return profiles, queues, flows
 
     # ------------------------------------------------------------------
     # Console output
@@ -186,19 +203,12 @@ class SkillDeletionProcessor:
             tbl = Table(title="Queues  [dim](confirmation required)[/dim]", style="yellow")
             tbl.add_column("Name")
             tbl.add_column("ID", style="dim")
-            tbl.add_column("Impact")
-            for entry in queues:
-                q = entry["queue"]
-                impact = (
-                    "Direct skill reference — will be removed"
-                    if entry["reason"] == "direct"
-                    else "Uses an affected skill profile — routing will change"
-                )
-                tbl.add_row(q.get("name", "—"), q.get("id", "—"), impact)
+            for q in queues:
+                tbl.add_row(q.get("name", "—"), q.get("id", "—"))
             console.print(tbl)
 
         if flows:
-            tbl = Table(title="Flows  [dim](manual review needed after deletion)[/dim]", style="red")
+            tbl = Table(title="Flows  [dim](blocks deletion — must be removed first)[/dim]", style="red")
             tbl.add_column("Name")
             tbl.add_column("ID", style="dim")
             for f in flows:
@@ -209,44 +219,26 @@ class SkillDeletionProcessor:
     # Confirmation
     # ------------------------------------------------------------------
 
-    def _get_approval(
-        self,
-        skill_name: str,
-        profiles: list,
-        queues: list,
-        flows: list,
-    ) -> bool:
+    def _get_approval(self, skill_name: str, profiles: list, queues: list) -> bool:
         if self.dry_run:
             return True
 
-        if queues or flows:
+        if queues:
             console.print(
                 "\n[bold yellow]Warning:[/bold yellow] Proceeding will:\n"
                 + (f"  • Remove this skill from [bold]{len(profiles)}[/bold] skill profile(s)\n" if profiles else "")
-                + (f"  • Modify or affect [bold]{len(queues)}[/bold] queue(s)\n" if queues else "")
-                + (f"  • Leave [bold]{len(flows)}[/bold] flow(s) requiring manual review\n" if flows else "")
+                + f"  • Remove this skill from [bold]{len(queues)}[/bold] queue(s)\n"
                 + f"  • Permanently delete skill definition [bold]{skill_name!r}[/bold]"
             )
             return Confirm.ask("Proceed?", default=False)
 
-        if profiles:
-            return Confirm.ask(
-                f"Remove from {len(profiles)} skill profile(s) and delete "
-                f"[bold]{skill_name!r}[/bold]?",
-                default=False,
-            )
-
-        # No references at all
-        return Confirm.ask(
-            f"No references found. Delete skill [bold]{skill_name!r}[/bold]?",
-            default=False,
-        )
+        return True
 
     # ------------------------------------------------------------------
     # Mutation helpers
     # ------------------------------------------------------------------
 
-    def _remove_from_profile(self, profile: dict, skill_id: str):
+    def _remove_from_profile(self, profile: dict, skill_id: str) -> bool:
         pid = profile["id"]
         try:
             fresh = self.client.get_skill_profile(pid)
@@ -261,10 +253,12 @@ class SkillDeletionProcessor:
                 f"  [green]✓[/green] Skill profile [bold]{fresh.get('name', pid)}[/bold]"
                 f" — removed {removed} entry"
             )
+            return True
         except WxCCAPIError as exc:
             console.print(f"  [red]✗[/red] Could not update profile {pid}: {exc}")
+            return False
 
-    def _remove_from_queue(self, queue: dict, skill_id: str):
+    def _remove_from_queue(self, queue: dict, skill_id: str) -> bool:
         qid = queue["id"]
         try:
             fresh = self.client.get_queue(qid)
@@ -280,5 +274,24 @@ class SkillDeletionProcessor:
                     f"  [green]✓[/green] Queue [bold]{fresh.get('name', qid)}[/bold]"
                     f" — removed {removed} direct skill entry"
                 )
+            return True
         except WxCCAPIError as exc:
             console.print(f"  [red]✗[/red] Could not update queue {qid}: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Report
+    # ------------------------------------------------------------------
+
+    def write_report(self, path: str) -> None:
+        if not self.results:
+            return
+        fieldnames = [
+            "timestamp", "input", "skill_name", "skill_id", "status",
+            "profiles_updated", "queues_updated", "flows_flagged", "notes",
+        ]
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.results)
+        console.print(f"\n[dim]Report saved → {path}[/dim]")
